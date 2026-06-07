@@ -1,3 +1,4 @@
+
 """
 Guest Registration Automation
 ------------------------------
@@ -35,6 +36,8 @@ SMTP_PORT       = int(os.environ.get("SMTP_PORT", "465"))
 ELIGIBLE_UNITS_RAW = os.environ.get("ELIGIBLE_UNITS", "")
 ELIGIBLE_UNITS = [u.strip().lower() for u in ELIGIBLE_UNITS_RAW.split(",") if u.strip()]
 BUILDING_EMAIL = os.environ.get("BUILDING_EMAIL")  # front desk email
+CC_EMAILS_RAW  = os.environ.get("CC_EMAILS", "")   # comma-separated list of CC addresses
+CC_EMAILS      = [e.strip() for e in CC_EMAILS_RAW.split(",") if e.strip()]
 DB_PATH        = os.environ.get("DB_PATH", "reservations.db")
 # Unit number is read automatically from each booking — works across all your units
  
@@ -157,6 +160,8 @@ Property Management
     msg = MIMEMultipart()
     msg["From"]    = EMAIL_USER
     msg["To"]      = BUILDING_EMAIL
+    if CC_EMAILS:
+        msg["Cc"] = ", ".join(CC_EMAILS)
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
  
@@ -168,9 +173,10 @@ Property Management
         part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
         msg.attach(part)
  
+    all_recipients = [BUILDING_EMAIL] + CC_EMAILS
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
         server.login(EMAIL_USER, EMAIL_PASSWORD)
-        server.send_message(msg)
+        server.sendmail(EMAIL_USER, all_recipients, msg.as_string())
  
     print(f"[✅] Email sent to {BUILDING_EMAIL}")
  
@@ -394,4 +400,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"[🚀] Server starting on port {port}")
     app.run(host="0.0.0.0", port=port)
- 
