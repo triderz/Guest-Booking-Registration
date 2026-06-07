@@ -25,12 +25,15 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────
 # Configuration  (set these as environment variables — see instructions)
 # ─────────────────────────────────────────────
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
-EMAIL_USER     = os.environ.get("EMAIL_USER")      # your full email address (e.g. you@yourdomain.com)
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")  # your email account password
-SMTP_HOST      = os.environ.get("SMTP_HOST", "smtpout.secureserver.net")  # GoDaddy default
-SMTP_PORT      = int(os.environ.get("SMTP_PORT", "465"))
-# Note: unit number is read automatically from each booking — no env var needed
+CLAUDE_API_KEY  = os.environ.get("CLAUDE_API_KEY")
+EMAIL_USER      = os.environ.get("EMAIL_USER")       # your full email address (e.g. you@yourdomain.com)
+EMAIL_PASSWORD  = os.environ.get("EMAIL_PASSWORD")   # your email account password
+SMTP_HOST       = os.environ.get("SMTP_HOST", "smtpout.secureserver.net")  # GoDaddy default
+SMTP_PORT       = int(os.environ.get("SMTP_PORT", "465"))
+# Comma-separated list of property names (exactly as they appear in Hospitable) that need registration
+# Example: "Unit 4B,Unit 5A,Unit 6C"
+ELIGIBLE_UNITS_RAW = os.environ.get("ELIGIBLE_UNITS", "")
+ELIGIBLE_UNITS = [u.strip().lower() for u in ELIGIBLE_UNITS_RAW.split(",") if u.strip()]
 BUILDING_EMAIL = os.environ.get("BUILDING_EMAIL")  # front desk email
 DB_PATH        = os.environ.get("DB_PATH", "reservations.db")
 # Unit number is read automatically from each booking — works across all your units
@@ -220,6 +223,13 @@ def handle_webhook():
         reservation.get("unit_number") or
         ""
     )
+ 
+    # If ELIGIBLE_UNITS is set, skip properties not on the list
+    if ELIGIBLE_UNITS and unit_from_booking.lower() not in ELIGIBLE_UNITS:
+        print(f"[⏭] Skipping property '{unit_from_booking}' — not in ELIGIBLE_UNITS list")
+        conn.close()
+        return jsonify({"status": f"ignored - property '{unit_from_booking}' not eligible"}), 200
+ 
     context = {
         "guest_name": guest_obj.get("name", ""),
         "checkin":    reservation.get("check_in", reservation.get("checkin", "")),
