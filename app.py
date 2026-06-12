@@ -1,4 +1,3 @@
-
 """
 Guest Registration Automation
 ------------------------------
@@ -41,7 +40,15 @@ CC_EMAILS      = [e.strip() for e in CC_EMAILS_RAW.split(",") if e.strip()]
 DB_PATH        = os.environ.get("DB_PATH", "reservations.db")
 # Unit number is read automatically from each booking — works across all your units
  
-claude = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+# Lazily created so a missing CLAUDE_API_KEY doesn't crash the whole app at startup
+_claude_client = None
+def get_claude():
+    global _claude_client
+    if _claude_client is None:
+        if not CLAUDE_API_KEY:
+            raise RuntimeError("CLAUDE_API_KEY environment variable is not set")
+        _claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    return _claude_client
  
 # ─────────────────────────────────────────────
 # Database
@@ -104,7 +111,7 @@ Extract whatever registration information is present. Return ONLY a JSON object 
  
 Return ONLY the JSON — no explanation, no markdown."""
  
-    response = claude.messages.create(
+    response = get_claude().messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=400,
         messages=[{"role": "user", "content": prompt}]
