@@ -402,8 +402,12 @@ def debug_reservations():
 # ─────────────────────────────────────────────
 # Start
 # ─────────────────────────────────────────────
+# Initialize the database on import so it works whether started via
+# "python app.py" OR via gunicorn (Procfile) — gunicorn never runs __main__.
+init_db()
+ 
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 5000))
     print(f"[🚀] Server starting on port {port}")
     app.run(host="0.0.0.0", port=port)
+ 
