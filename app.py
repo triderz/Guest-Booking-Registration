@@ -12,6 +12,7 @@ import json
 import sqlite3
 import requests
 import smtplib
+import traceback
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -22,6 +23,9 @@ from flask import Flask, request, jsonify
 import anthropic
 
 app = Flask(__name__)
+
+# Stores the last unexpected error so it can be viewed at /debug/last-error
+LAST_ERROR = None
 
 # ─────────────────────────────────────────────
 # Configuration  (set these as environment variables — see instructions)
@@ -191,13 +195,12 @@ Extract whatever registration information is present. Return ONLY a JSON object 
 
 Return ONLY the JSON — no explanation, no markdown."""
 
-    response = get_claude().messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=400,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
     try:
+        response = get_claude().messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
+        )
         text = response.content[0].text.strip()
         # Strip markdown code fences if present
         if text.startswith("```"):
@@ -206,7 +209,7 @@ Return ONLY the JSON — no explanation, no markdown."""
                 text = text[4:]
         return json.loads(text.strip())
     except Exception as e:
-        print(f"[WARN] Could not parse Claude response: {e}")
+        print(f"[WARN] Could not get/parse Claude response: {e}")
         return {}
 
 
@@ -273,6 +276,7 @@ Property Management
 # ─────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def handle_webhook():
+    global LAST_ERROR
     raw = request.get_json(force=True, silent=True)
     if not raw:
         return jsonify({"error": "Empty payload"}), 400
@@ -284,172 +288,183 @@ def handle_webhook():
               (datetime.now().isoformat(), json.dumps(raw)))
     conn.commit()
 
-    action = raw.get("action", "")
-    if action and action != "message.created":
-        conn.close()
-        return jsonify({"status": f"ignored action: {action}"}), 200
-
-    # ── Parse Hospitable v2 message.created webhook structure ──
-    # The real payload looks like:
-    # {
-    #   "action": "message.created",
-    #   "data": {
-    #     "id": 123, "body": "...", "attachments": [...],
-    #     "reservation_id": "...", "property": {"name": "...", "public_name": "..."},
-    #     "sender_role": "guest" | "host", "sender_type": "guest" | "host", ...
-    #   }
-    # }
-    data = raw.get("data", raw)
-
-    # Only handle inbound guest messages — skip anything sent by the host/team
-    sender_role = (data.get("sender_role") or data.get("sender_type") or "").lower()
-    if sender_role in ("host", "team", "assistant", "owner"):
-        conn.close()
-        return jsonify({"status": "ignored - host message"}), 200
-
-    reservation_id = data.get("reservation_id") or data.get("reservation", {}).get("id") or ""
-    if not reservation_id:
-        conn.close()
-        return jsonify({"error": "No reservation ID found"}), 400
-
-    # Property / unit info comes directly on the message payload
-    prop_obj = data.get("property") or {}
-    unit_from_booking = (
-        prop_obj.get("name") or
-        prop_obj.get("public_name") or
-        prop_obj.get("internal_name") or
-        ""
-    )
-
-    # If ELIGIBLE_UNITS is set, skip properties whose name doesn't contain any of the listed keywords
-    property_name_lower = unit_from_booking.lower()
-    if ELIGIBLE_UNITS and not any(keyword in property_name_lower for keyword in ELIGIBLE_UNITS):
-        print(f"[⏭] Skipping property '{unit_from_booking}' — not in ELIGIBLE_UNITS list")
-        conn.close()
-        return jsonify({"status": f"ignored - property '{unit_from_booking}' not eligible"}), 200
-
-    # Check-in/check-out dates and the guest's name aren't included in the
-    # message webhook itself, so fetch them from the Hospitable API.
-    res_details = get_reservation_details(reservation_id)
-
-    context = {
-        "guest_name": res_details.get("guest_name", ""),
-        "checkin":    res_details.get("checkin", ""),
-        "checkout":   res_details.get("checkout", ""),
-        "unit":       extract_unit_label(unit_from_booking) or unit_from_booking,
-    }
-
-    # Message content + attachments
-    message_text = data.get("body", "")
-    attachments  = data.get("attachments") or []
-
-    # ── Load existing record ──
-    c.execute("SELECT email_sent, raw_messages, id_image_urls FROM reservations WHERE reservation_id = ?",
-              (reservation_id,))
-    row = c.fetchone()
-    if row and row[0]:  # email already sent
-        conn.close()
-        return jsonify({"status": "already sent"}), 200
-
-    existing_messages  = json.loads(row[1]) if row and row[1] else []
-    existing_image_urls = json.loads(row[2]) if row and row[2] else []
-
-    # Add this message
-    existing_messages.append({
-        "content":     message_text,
-        "attachments": attachments,
-        "timestamp":   datetime.now().isoformat(),
-    })
-
-    # Collect image URLs across all messages
-    for att in attachments:
-        url       = att.get("url", att.get("download_url", ""))
-        mime_type = att.get("type", att.get("mime_type", att.get("content_type", "")))
-        if url and url not in existing_image_urls:
-            is_image = "image" in mime_type.lower() if mime_type else (
-                any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".pdf", ".heic"))
-            )
-            if is_image:
-                existing_image_urls.append(url)
-
-    # ── Extract info with AI ──
-    all_text = "\n\n---\n\n".join(
-        m["content"] for m in existing_messages if m.get("content")
-    )
-    extracted = extract_guest_info(all_text, context)
-
-    # Fall back to booking-level data for dates / unit if AI didn't find them in messages
-    if not extracted.get("checkin_date")  and context.get("checkin"):
-        extracted["checkin_date"]  = context["checkin"]
-    if not extracted.get("checkout_date") and context.get("checkout"):
-        extracted["checkout_date"] = context["checkout"]
-    if not extracted.get("unit_number") and context.get("unit"):
-        extracted["unit_number"] = context["unit"]
-    if not extracted.get("guest_names")   and context.get("guest_name"):
-        extracted["guest_names"]   = [context["guest_name"]]
-
-    # ── Completeness check ──
-    has_names  = bool(extracted.get("guest_names"))
-    has_phone  = bool(extracted.get("contact_number"))
-    has_email  = bool(extracted.get("contact_email"))
-    has_dates  = bool(extracted.get("checkin_date") and extracted.get("checkout_date"))
-    has_unit   = bool(extracted.get("unit_number"))
-    has_ids    = len(existing_image_urls) > 0
-
-    all_complete = has_names and has_phone and has_email and has_dates and has_unit and has_ids
-
-    # ── Save / update DB ──
-    c.execute("""
-        INSERT OR REPLACE INTO reservations
-        (reservation_id, guest_names, contact_number, contact_email,
-         checkin_date, checkout_date, unit_number, id_image_urls, email_sent, raw_messages, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-    """, (
-        reservation_id,
-        json.dumps(extracted.get("guest_names", [])),
-        extracted.get("contact_number", ""),
-        extracted.get("contact_email", ""),
-        extracted.get("checkin_date", ""),
-        extracted.get("checkout_date", ""),
-        extracted.get("unit_number", ""),
-        json.dumps(existing_image_urls),
-        json.dumps(existing_messages),
-        datetime.now().isoformat(),
-    ))
-    conn.commit()
-
-    # ── If complete, download IDs and send email ──
-    if all_complete:
-        id_attachments = []
-        for i, url in enumerate(existing_image_urls):
-            try:
-                resp = requests.get(url, timeout=30)
-                if resp.status_code == 200:
-                    ct  = resp.headers.get("Content-Type", "")
-                    ext = "pdf" if "pdf" in ct else "heic" if "heic" in ct else "jpg"
-                    id_attachments.append((f"guest_id_{i + 1}.{ext}", resp.content))
-            except Exception as e:
-                print(f"[WARN] Could not download ID image {url}: {e}")
-
-        try:
-            send_building_email(extracted, id_attachments)
-            c.execute("UPDATE reservations SET email_sent = 1 WHERE reservation_id = ?", (reservation_id,))
-            conn.commit()
-        except Exception as e:
-            print(f"[ERROR] Email failed: {e}")
+    try:
+        action = raw.get("action", "")
+        if action and action != "message.created":
             conn.close()
-            return jsonify({"error": f"Email failed: {e}"}), 500
-    else:
-        missing = []
-        if not has_names:  missing.append("guest names")
-        if not has_phone:  missing.append("contact number")
-        if not has_email:  missing.append("contact email")
-        if not has_dates:  missing.append("check-in/out dates")
-        if not has_ids:    missing.append("ID photo(s)")
-        print(f"[⏳] Reservation {reservation_id}: still waiting for {', '.join(missing)}")
+            return jsonify({"status": f"ignored action: {action}"}), 200
 
-    conn.close()
-    return jsonify({"status": "ok", "email_sent": all_complete}), 200
+        # ── Parse Hospitable v2 message.created webhook structure ──
+        # The real payload looks like:
+        # {
+        #   "action": "message.created",
+        #   "data": {
+        #     "id": 123, "body": "...", "attachments": [...],
+        #     "reservation_id": "...", "property": {"name": "...", "public_name": "..."},
+        #     "sender_role": "guest" | "host", "sender_type": "guest" | "host", ...
+        #   }
+        # }
+        data = raw.get("data", raw)
+
+        # Only handle inbound guest messages — skip anything sent by the host/team
+        sender_role = (data.get("sender_role") or data.get("sender_type") or "").lower()
+        if sender_role in ("host", "team", "assistant", "owner"):
+            conn.close()
+            return jsonify({"status": "ignored - host message"}), 200
+
+        reservation_id = data.get("reservation_id") or data.get("reservation", {}).get("id") or ""
+        if not reservation_id:
+            conn.close()
+            return jsonify({"error": "No reservation ID found"}), 400
+
+        # Property / unit info comes directly on the message payload
+        prop_obj = data.get("property") or {}
+        unit_from_booking = (
+            prop_obj.get("name") or
+            prop_obj.get("public_name") or
+            prop_obj.get("internal_name") or
+            ""
+        )
+
+        # If ELIGIBLE_UNITS is set, skip properties whose name doesn't contain any of the listed keywords
+        property_name_lower = unit_from_booking.lower()
+        if ELIGIBLE_UNITS and not any(keyword in property_name_lower for keyword in ELIGIBLE_UNITS):
+            print(f"[⏭] Skipping property '{unit_from_booking}' — not in ELIGIBLE_UNITS list")
+            conn.close()
+            return jsonify({"status": f"ignored - property '{unit_from_booking}' not eligible"}), 200
+
+        # Check-in/check-out dates and the guest's name aren't included in the
+        # message webhook itself, so fetch them from the Hospitable API.
+        res_details = get_reservation_details(reservation_id)
+
+        context = {
+            "guest_name": res_details.get("guest_name", ""),
+            "checkin":    res_details.get("checkin", ""),
+            "checkout":   res_details.get("checkout", ""),
+            "unit":       extract_unit_label(unit_from_booking) or unit_from_booking,
+        }
+
+        # Message content + attachments
+        message_text = data.get("body", "")
+        attachments  = data.get("attachments") or []
+
+        # ── Load existing record ──
+        c.execute("SELECT email_sent, raw_messages, id_image_urls FROM reservations WHERE reservation_id = ?",
+                  (reservation_id,))
+        row = c.fetchone()
+        if row and row[0]:  # email already sent
+            conn.close()
+            return jsonify({"status": "already sent"}), 200
+
+        existing_messages  = json.loads(row[1]) if row and row[1] else []
+        existing_image_urls = json.loads(row[2]) if row and row[2] else []
+
+        # Add this message
+        existing_messages.append({
+            "content":     message_text,
+            "attachments": attachments,
+            "timestamp":   datetime.now().isoformat(),
+        })
+
+        # Collect image URLs across all messages
+        for att in attachments:
+            url       = att.get("url", att.get("download_url", ""))
+            mime_type = att.get("type", att.get("mime_type", att.get("content_type", "")))
+            if url and url not in existing_image_urls:
+                is_image = "image" in mime_type.lower() if mime_type else (
+                    any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".pdf", ".heic"))
+                )
+                if is_image:
+                    existing_image_urls.append(url)
+
+        # ── Extract info with AI ──
+        all_text = "\n\n---\n\n".join(
+            m["content"] for m in existing_messages if m.get("content")
+        )
+        extracted = extract_guest_info(all_text, context)
+
+        # Fall back to booking-level data for dates / unit if AI didn't find them in messages
+        if not extracted.get("checkin_date")  and context.get("checkin"):
+            extracted["checkin_date"]  = context["checkin"]
+        if not extracted.get("checkout_date") and context.get("checkout"):
+            extracted["checkout_date"] = context["checkout"]
+        if not extracted.get("unit_number") and context.get("unit"):
+            extracted["unit_number"] = context["unit"]
+        if not extracted.get("guest_names")   and context.get("guest_name"):
+            extracted["guest_names"]   = [context["guest_name"]]
+
+        # ── Completeness check ──
+        has_names  = bool(extracted.get("guest_names"))
+        has_phone  = bool(extracted.get("contact_number"))
+        has_email  = bool(extracted.get("contact_email"))
+        has_dates  = bool(extracted.get("checkin_date") and extracted.get("checkout_date"))
+        has_unit   = bool(extracted.get("unit_number"))
+        has_ids    = len(existing_image_urls) > 0
+
+        all_complete = has_names and has_phone and has_email and has_dates and has_unit and has_ids
+
+        # ── Save / update DB ──
+        c.execute("""
+            INSERT OR REPLACE INTO reservations
+            (reservation_id, guest_names, contact_number, contact_email,
+             checkin_date, checkout_date, unit_number, id_image_urls, email_sent, raw_messages, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        """, (
+            reservation_id,
+            json.dumps(extracted.get("guest_names", [])),
+            extracted.get("contact_number", ""),
+            extracted.get("contact_email", ""),
+            extracted.get("checkin_date", ""),
+            extracted.get("checkout_date", ""),
+            extracted.get("unit_number", ""),
+            json.dumps(existing_image_urls),
+            json.dumps(existing_messages),
+            datetime.now().isoformat(),
+        ))
+        conn.commit()
+
+        # ── If complete, download IDs and send email ──
+        if all_complete:
+            id_attachments = []
+            for i, url in enumerate(existing_image_urls):
+                try:
+                    resp = requests.get(url, timeout=30)
+                    if resp.status_code == 200:
+                        ct  = resp.headers.get("Content-Type", "")
+                        ext = "pdf" if "pdf" in ct else "heic" if "heic" in ct else "jpg"
+                        id_attachments.append((f"guest_id_{i + 1}.{ext}", resp.content))
+                except Exception as e:
+                    print(f"[WARN] Could not download ID image {url}: {e}")
+
+            try:
+                send_building_email(extracted, id_attachments)
+                c.execute("UPDATE reservations SET email_sent = 1 WHERE reservation_id = ?", (reservation_id,))
+                conn.commit()
+            except Exception as e:
+                LAST_ERROR = traceback.format_exc()
+                print(f"[ERROR] Email failed: {e}")
+                conn.close()
+                return jsonify({"error": f"Email failed: {e}"}), 500
+        else:
+            missing = []
+            if not has_names:  missing.append("guest names")
+            if not has_phone:  missing.append("contact number")
+            if not has_email:  missing.append("contact email")
+            if not has_dates:  missing.append("check-in/out dates")
+            if not has_ids:    missing.append("ID photo(s)")
+            print(f"[⏳] Reservation {reservation_id}: still waiting for {', '.join(missing)}")
+
+        conn.close()
+        return jsonify({"status": "ok", "email_sent": all_complete}), 200
+
+    except Exception as e:
+        LAST_ERROR = traceback.format_exc()
+        print(f"[ERROR] Webhook processing failed:\n{LAST_ERROR}")
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return jsonify({"error": str(e), "detail": "see /debug/last-error"}), 500
 
 
 # ─────────────────────────────────────────────
@@ -458,6 +473,14 @@ def handle_webhook():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "running", "time": datetime.now().isoformat()}), 200
+
+
+@app.route("/debug/last-error", methods=["GET"])
+def debug_last_error():
+    """Show the most recent unexpected error from /webhook processing, if any."""
+    if LAST_ERROR:
+        return jsonify({"last_error": LAST_ERROR}), 200
+    return jsonify({"last_error": None}), 200
 
 
 @app.route("/debug/webhooks", methods=["GET"])
