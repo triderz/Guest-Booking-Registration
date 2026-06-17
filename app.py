@@ -475,6 +475,20 @@ def health():
     return jsonify({"status": "running", "time": datetime.now().isoformat()}), 200
  
  
+@app.route("/debug/env-check", methods=["GET"])
+def debug_env_check():
+    """Check what environment variables the running process actually sees."""
+    token_live = os.environ.get("HOSPITABLE_API_TOKEN", "")
+    return jsonify({
+        "HOSPITABLE_API_TOKEN_present": "HOSPITABLE_API_TOKEN" in os.environ,
+        "HOSPITABLE_API_TOKEN_length": len(token_live),
+        "HOSPITABLE_API_TOKEN_first_10_chars": token_live[:10] if token_live else "(empty)",
+        "CLAUDE_API_KEY_present": "CLAUDE_API_KEY" in os.environ,
+        "BUILDING_EMAIL_present": "BUILDING_EMAIL" in os.environ,
+        "ELIGIBLE_UNITS_value": os.environ.get("ELIGIBLE_UNITS", "(not set)"),
+    }), 200
+ 
+ 
 @app.route("/debug/last-error", methods=["GET"])
 def debug_last_error():
     """Show the most recent unexpected error from /webhook processing, if any."""
