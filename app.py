@@ -9,15 +9,11 @@ Sends a formatted email to your building's front desk automatically.
 import os
 import re
 import json
+import base64
 import sqlite3
 import requests
-import smtplib
 import traceback
 from datetime import datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
 
 from flask import Flask, request, jsonify
 import anthropic
@@ -31,10 +27,8 @@ LAST_ERROR = None
 # Configuration  (set these as environment variables — see instructions)
 # ─────────────────────────────────────────────
 CLAUDE_API_KEY  = os.environ.get("CLAUDE_API_KEY")
-EMAIL_USER      = os.environ.get("EMAIL_USER")       # your full email address (e.g. you@yourdomain.com)
-EMAIL_PASSWORD  = os.environ.get("EMAIL_PASSWORD")   # your email account password
-SMTP_HOST       = os.environ.get("SMTP_HOST", "smtpout.secureserver.net")  # GoDaddy default
-SMTP_PORT       = int(os.environ.get("SMTP_PORT", "465"))
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")  # from sendgrid.com
+EMAIL_FROM       = os.environ.get("EMAIL_USER", "info@atozvacationhomes.com")  # verified sender
 # Comma-separated list of keywords. A property is "in the building" if its
 # Hospitable property name CONTAINS any of these keywords (case-insensitive).
 # Example: "Crosby" will match "Crosby 3201 Gian Top Floor Penthouse",
@@ -214,7 +208,7 @@ Return ONLY the JSON — no explanation, no markdown."""
 
 
 # ─────────────────────────────────────────────
-# Email sender
+# Email sender (SendGrid HTTP API — no SMTP ports needed)
 # ─────────────────────────────────────────────
 def send_building_email(info, id_attachments):
     guest_names = info.get("guest_names") or []
@@ -224,9 +218,8 @@ def send_building_email(info, id_attachments):
     phone       = info.get("contact_number", "Not provided")
     email_addr  = info.get("contact_email", "Not provided")
 
-    subject = f"Guest Registration – Unit {unit} | Check-in: {checkin} / Check-out: {checkout}"
+    subject = f"Guest Registration – {unit} | Check-in: {checkin} / Check-out: {checkout}"
 
-    # Numbered guest name list
     names_list = "\n".join(f"   {i+1}. {name}" for i, name in enumerate(guest_names)) \
                  if guest_names else "   1. (not provided)"
 
@@ -247,37 +240,46 @@ Thank you,
 Property Management
 """
 
-    msg = MIMEMultipart()
-    msg["From"]    = EMAIL_USER
-    msg["To"]      = BUILDING_EMAIL
-    if CC_EMAILS:
-        msg["Cc"] = ", ".join(CC_EMAILS)
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
+    # Build SendGrid API payload
+    to_list = [{"email": BUILDING_EMAIL}]
+    cc_list = [{"email": e} for e in CC_EMAILS] if CC_EMAILS else []
+
+    personalizations = [{"to": to_list, "subject": subject}]
+    if cc_list:
+        personalizations[0]["cc"] = cc_list
+
+    payload = {
+        "personalizations": personalizations,
+        "from": {"email": EMAIL_FROM, "name": "A to Z Vacation Homes"},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body}],
+    }
 
     # Attach ID images
-    for filename, file_bytes in id_attachments:
-        part = MIMEBase("application", "octet-stream")
-        part.set_payload(file_bytes)
-        encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
-        msg.attach(part)
+    if id_attachments:
+        payload["attachments"] = []
+        for filename, file_bytes in id_attachments:
+            payload["attachments"].append({
+                "content":     base64.b64encode(file_bytes).decode(),
+                "filename":    filename,
+                "type":        "application/octet-stream",
+                "disposition": "attachment",
+            })
 
-    all_recipients = [BUILDING_EMAIL] + CC_EMAILS
-    if SMTP_PORT == 465:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.login(EMAIL_USER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_USER, all_recipients, msg.as_string())
-    else:
-        # Port 587 (or any non-465 port) uses STARTTLS
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(EMAIL_USER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_USER, all_recipients, msg.as_string())
+    resp = requests.post(
+        "https://api.sendgrid.com/v3/mail/send",
+        headers={
+            "Authorization": f"Bearer {SENDGRID_API_KEY}",
+            "Content-Type":  "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
 
-    print(f"[✅] Email sent to {BUILDING_EMAIL}")
+    if resp.status_code not in (200, 202):
+        raise Exception(f"SendGrid error {resp.status_code}: {resp.text}")
+
+    print(f"[✅] Email sent via SendGrid to {BUILDING_EMAIL}")
 
 
 # ─────────────────────────────────────────────
@@ -515,17 +517,16 @@ def health():
 def debug_env_check():
     """Check what environment variables the running process actually sees."""
     token_live = os.environ.get("HOSPITABLE_API_TOKEN", "")
+    sg_key = os.environ.get("SENDGRID_API_KEY", "")
     return jsonify({
         "HOSPITABLE_API_TOKEN_present": "HOSPITABLE_API_TOKEN" in os.environ,
         "HOSPITABLE_API_TOKEN_length": len(token_live),
         "HOSPITABLE_API_TOKEN_first_10_chars": token_live[:10] if token_live else "(empty)",
         "CLAUDE_API_KEY_present": "CLAUDE_API_KEY" in os.environ,
-        "BUILDING_EMAIL_present": "BUILDING_EMAIL" in os.environ,
-        "EMAIL_USER_present": "EMAIL_USER" in os.environ,
-        "EMAIL_USER_value": os.environ.get("EMAIL_USER", "(not set)"),
-        "EMAIL_PASSWORD_present": "EMAIL_PASSWORD" in os.environ,
-        "SMTP_HOST": os.environ.get("SMTP_HOST", "smtpout.secureserver.net"),
-        "SMTP_PORT": os.environ.get("SMTP_PORT", "465"),
+        "SENDGRID_API_KEY_present": bool(sg_key),
+        "SENDGRID_API_KEY_first_5": sg_key[:5] if sg_key else "(empty)",
+        "EMAIL_FROM": os.environ.get("EMAIL_USER", "(not set)"),
+        "BUILDING_EMAIL": os.environ.get("BUILDING_EMAIL", "(not set)"),
         "CC_EMAILS_value": os.environ.get("CC_EMAILS", "(not set)"),
         "ELIGIBLE_UNITS_value": os.environ.get("ELIGIBLE_UNITS", "(not set)"),
     }), 200
@@ -617,41 +618,36 @@ def debug_test_extract(reservation_id):
 @app.route("/debug/test-email", methods=["GET"])
 def debug_test_email():
     """
-    Send a test email to BUILDING_EMAIL to confirm SMTP credentials and connectivity work.
+    Send a test email via SendGrid to confirm the API key and sender are working.
     This does NOT require a reservation — just checks that the email pipeline is functional.
     """
     result = {
-        "EMAIL_USER_present":    bool(EMAIL_USER),
-        "EMAIL_PASSWORD_present": bool(EMAIL_PASSWORD),
-        "BUILDING_EMAIL":        BUILDING_EMAIL or "(not set)",
-        "SMTP_HOST":             SMTP_HOST,
-        "SMTP_PORT":             SMTP_PORT,
+        "SENDGRID_API_KEY_present": bool(SENDGRID_API_KEY),
+        "EMAIL_FROM":               EMAIL_FROM,
+        "BUILDING_EMAIL":           BUILDING_EMAIL or "(not set)",
     }
-    if not EMAIL_USER or not EMAIL_PASSWORD or not BUILDING_EMAIL:
-        result["error"] = "Missing EMAIL_USER, EMAIL_PASSWORD, or BUILDING_EMAIL env var"
+    if not SENDGRID_API_KEY or not BUILDING_EMAIL:
+        result["error"] = "Missing SENDGRID_API_KEY or BUILDING_EMAIL env var"
         return jsonify(result), 500
     try:
-        msg = MIMEMultipart()
-        msg["From"]    = EMAIL_USER
-        msg["To"]      = BUILDING_EMAIL
-        msg["Subject"] = "[TEST] Guest Registration App — SMTP Check"
-        msg.attach(MIMEText(
-            "This is a test email from your Guest Registration app.\n\n"
-            "If you received this, SMTP is configured correctly.", "plain"
-        ))
-        if SMTP_PORT == 465:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-                server.login(EMAIL_USER, EMAIL_PASSWORD)
-                server.sendmail(EMAIL_USER, [BUILDING_EMAIL], msg.as_string())
+        payload = {
+            "personalizations": [{"to": [{"email": BUILDING_EMAIL}]}],
+            "from": {"email": EMAIL_FROM, "name": "A to Z Vacation Homes"},
+            "subject": "[TEST] Guest Registration App — SendGrid Check",
+            "content": [{"type": "text/plain", "value": "This is a test email from your Guest Registration app.\n\nIf you received this, SendGrid is configured correctly!"}],
+        }
+        resp = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=15,
+        )
+        if resp.status_code in (200, 202):
+            result["status"] = "Test email sent successfully!"
+            return jsonify(result), 200
         else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(EMAIL_USER, EMAIL_PASSWORD)
-                server.sendmail(EMAIL_USER, [BUILDING_EMAIL], msg.as_string())
-        result["status"] = "Test email sent successfully!"
-        return jsonify(result), 200
+            result["error"] = f"SendGrid error {resp.status_code}: {resp.text}"
+            return jsonify(result), 500
     except Exception as e:
         result["error"] = str(e)
         result["traceback"] = traceback.format_exc()
