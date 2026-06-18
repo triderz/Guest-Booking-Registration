@@ -264,9 +264,18 @@ Property Management
         msg.attach(part)
 
     all_recipients = [BUILDING_EMAIL] + CC_EMAILS
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-        server.login(EMAIL_USER, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_USER, all_recipients, msg.as_string())
+    if SMTP_PORT == 465:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.login(EMAIL_USER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_USER, all_recipients, msg.as_string())
+    else:
+        # Port 587 (or any non-465 port) uses STARTTLS
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(EMAIL_USER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_USER, all_recipients, msg.as_string())
 
     print(f"[✅] Email sent to {BUILDING_EMAIL}")
 
@@ -630,9 +639,17 @@ def debug_test_email():
             "This is a test email from your Guest Registration app.\n\n"
             "If you received this, SMTP is configured correctly.", "plain"
         ))
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-            server.login(EMAIL_USER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_USER, [BUILDING_EMAIL], msg.as_string())
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+                server.login(EMAIL_USER, EMAIL_PASSWORD)
+                server.sendmail(EMAIL_USER, [BUILDING_EMAIL], msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(EMAIL_USER, EMAIL_PASSWORD)
+                server.sendmail(EMAIL_USER, [BUILDING_EMAIL], msg.as_string())
         result["status"] = "Test email sent successfully!"
         return jsonify(result), 200
     except Exception as e:
