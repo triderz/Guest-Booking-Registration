@@ -152,6 +152,51 @@ def get_reservation_details(reservation_id):
         return {}
 
 
+def post_hospitable_note(reservation_id, note_text):
+    """Post a note in both Hospitable locations after the registration email is sent:
+    1. Guest info / reservation notes (internal record)
+    2. Message thread (internal note visible to host team only)
+    """
+    if not HOSPITABLE_API_TOKEN or not reservation_id:
+        return
+
+    headers = {
+        "Authorization": f"Bearer {HOSPITABLE_API_TOKEN}",
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+    }
+
+    # ── 1. Reservation / guest info note ──
+    try:
+        resp = requests.post(
+            f"{HOSPITABLE_API_BASE}/reservations/{reservation_id}/notes",
+            headers=headers,
+            json={"body": note_text},
+            timeout=15,
+        )
+        if resp.status_code in (200, 201):
+            print(f"[📝] Hospitable reservation note posted for {reservation_id}")
+        else:
+            print(f"[WARN] Reservation note failed ({resp.status_code}): {resp.text}")
+    except Exception as e:
+        print(f"[WARN] Could not post reservation note for {reservation_id}: {e}")
+
+    # ── 2. Message thread internal note ──
+    try:
+        resp = requests.post(
+            f"{HOSPITABLE_API_BASE}/reservations/{reservation_id}/messages",
+            headers=headers,
+            json={"body": note_text, "type": "note"},
+            timeout=15,
+        )
+        if resp.status_code in (200, 201):
+            print(f"[📝] Hospitable message thread note posted for {reservation_id}")
+        else:
+            print(f"[WARN] Message thread note failed ({resp.status_code}): {resp.text}")
+    except Exception as e:
+        print(f"[WARN] Could not post message thread note for {reservation_id}: {e}")
+
+
 # ─────────────────────────────────────────────
 # Database
 # ─────────────────────────────────────────────
@@ -560,6 +605,11 @@ def handle_webhook():
                 send_building_email(extracted, id_attachments, to_email=building_email_to)
                 c.execute("UPDATE reservations SET email_sent = 1 WHERE reservation_id = ?", (reservation_id,))
                 conn.commit()
+                sent_at = datetime.now().strftime("%m/%d/%Y at %I:%M %p UTC")
+                post_hospitable_note(reservation_id,
+                    f"✅ Guest registration email sent to {building_email_to} on {sent_at}. "
+                    f"Guests: {', '.join(extracted.get('guest_names', []))}. "
+                    f"IDs attached: {len(id_attachments)}.")
             except Exception as e:
                 LAST_ERROR = traceback.format_exc()
                 print(f"[ERROR] Email failed: {e}")
@@ -802,9 +852,15 @@ def debug_trigger_send(reservation_id):
     ]
 
     try:
-        send_building_email(extracted, id_attachments)
+        building_email_to = resolve_building_email(unit_number)
+        send_building_email(extracted, id_attachments, to_email=building_email_to)
         c.execute("UPDATE reservations SET email_sent = 1 WHERE reservation_id = ?", (reservation_id,))
         conn.commit()
+        sent_at = datetime.now().strftime("%m/%d/%Y at %I:%M %p UTC")
+        post_hospitable_note(reservation_id,
+            f"✅ Guest registration email sent to {building_email_to} on {sent_at}. "
+            f"Guests: {', '.join(extracted.get('guest_names', []))}. "
+            f"IDs attached: {len(id_attachments)}.")
         conn.close()
         return jsonify({
             "status": "Email sent successfully!",
@@ -898,6 +954,11 @@ def check_pending():
             send_building_email(extracted, id_attachments, to_email=building_email_to)
             c.execute("UPDATE reservations SET email_sent = 1 WHERE reservation_id = ?", (res_id,))
             conn.commit()
+            sent_at = datetime.now().strftime("%m/%d/%Y at %I:%M %p UTC")
+            post_hospitable_note(res_id,
+                f"✅ Guest registration email sent to {building_email_to} on {sent_at}. "
+                f"Guests: {', '.join(extracted.get('guest_names', []))}. "
+                f"IDs attached: {len(id_attachments)}.")
             sent.append({"reservation_id": res_id, "unit": unit, "sent_to": building_email_to})
             print(f"[✅] check-pending: sent email for {res_id} ({unit})")
         except Exception as e:
