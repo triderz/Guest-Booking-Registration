@@ -13,7 +13,7 @@ import base64
 import sqlite3
 import requests
 import traceback
-from datetime import datetime
+from datetime import datetime, date
 
 from flask import Flask, request, jsonify
 import anthropic
@@ -35,9 +35,33 @@ EMAIL_FROM       = os.environ.get("EMAIL_USER", "info@atozvacationhomes.com")  #
 # "Crosby 1205 ...", etc. Leave blank to apply to ALL properties.
 ELIGIBLE_UNITS_RAW = os.environ.get("ELIGIBLE_UNITS", "")
 ELIGIBLE_UNITS = [u.strip().lower() for u in ELIGIBLE_UNITS_RAW.split(",") if u.strip()]
-BUILDING_EMAIL = os.environ.get("BUILDING_EMAIL")  # front desk email
+BUILDING_EMAIL = os.environ.get("BUILDING_EMAIL")  # fallback front desk email
 CC_EMAILS_RAW  = os.environ.get("CC_EMAILS", "")   # comma-separated list of CC addresses
 CC_EMAILS      = [e.strip() for e in CC_EMAILS_RAW.split(",") if e.strip()]
+
+# Multi-building routing: maps property name keywords to specific front desk emails.
+# Format: "keyword1:email1;keyword2:email2"
+# Example: "crosby:frontdesk@thecrosbymiami.com;district 225:frontdesk@district225miami.com"
+# The property name is checked (case-insensitive) for each keyword in order.
+# Falls back to BUILDING_EMAIL if no keyword matches.
+_BUILDING_ROUTING_RAW = os.environ.get("BUILDING_ROUTING", "")
+BUILDING_ROUTING = []  # list of (keyword_lower, email) tuples
+for _entry in _BUILDING_ROUTING_RAW.split(";"):
+    _entry = _entry.strip()
+    if ":" in _entry:
+        _kw, _em = _entry.split(":", 1)
+        if _kw.strip() and _em.strip():
+            BUILDING_ROUTING.append((_kw.strip().lower(), _em.strip()))
+
+
+def resolve_building_email(property_name):
+    """Return the front desk email for the given property name, using BUILDING_ROUTING
+    keyword matching. Falls back to BUILDING_EMAIL if nothing matches."""
+    name_lower = (property_name or "").lower()
+    for keyword, email in BUILDING_ROUTING:
+        if keyword in name_lower:
+            return email
+    return BUILDING_EMAIL
 DB_PATH        = os.environ.get("DB_PATH", "reservations.db")
 # Unit number is read automatically from each booking — works across all your units
 
@@ -144,11 +168,18 @@ def init_db():
             checkout_date    TEXT,
             unit_number      TEXT,
             id_image_urls    TEXT,
+            id_image_data    TEXT DEFAULT '[]',
             email_sent       INTEGER DEFAULT 0,
             raw_messages     TEXT,
             updated_at       TEXT
         )
     """)
+    # Migration: add id_image_data column to existing DBs that predate this column
+    try:
+        c.execute("ALTER TABLE reservations ADD COLUMN id_image_data TEXT DEFAULT '[]'")
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
     # Store raw webhook payloads for debugging
     c.execute("""
         CREATE TABLE IF NOT EXISTS webhook_log (
@@ -210,7 +241,12 @@ Return ONLY the JSON — no explanation, no markdown."""
 # ─────────────────────────────────────────────
 # Email sender (SendGrid HTTP API — no SMTP ports needed)
 # ─────────────────────────────────────────────
-def send_building_email(info, id_attachments):
+def send_building_email(info, id_attachments, to_email=None):
+    """Send registration email to the building front desk via SendGrid.
+
+    to_email overrides BUILDING_EMAIL (used for per-building routing).
+    """
+    recipient = to_email or BUILDING_EMAIL
     guest_names = info.get("guest_names") or []
     checkin     = info.get("checkin_date", "TBD")
     checkout    = info.get("checkout_date", "TBD")
@@ -241,7 +277,7 @@ Property Management
 """
 
     # Build SendGrid API payload
-    to_list = [{"email": BUILDING_EMAIL}]
+    to_list = [{"email": recipient}]
     cc_list = [{"email": e} for e in CC_EMAILS] if CC_EMAILS else []
 
     personalizations = [{"to": to_list, "subject": subject}]
@@ -279,7 +315,7 @@ Property Management
     if resp.status_code not in (200, 202):
         raise Exception(f"SendGrid error {resp.status_code}: {resp.text}")
 
-    print(f"[✅] Email sent via SendGrid to {BUILDING_EMAIL}")
+    print(f"[✅] Email sent via SendGrid to {recipient}")
 
 
 # ─────────────────────────────────────────────
@@ -344,6 +380,9 @@ def handle_webhook():
             conn.close()
             return jsonify({"status": f"ignored - property '{unit_from_booking}' not eligible"}), 200
 
+        # Resolve the correct front desk email for this property
+        building_email_to = resolve_building_email(unit_from_booking)
+
         # Check-in/check-out dates and the guest's name aren't included in the
         # message webhook itself, so fetch them from the Hospitable API.
         res_details = get_reservation_details(reservation_id)
@@ -360,15 +399,19 @@ def handle_webhook():
         attachments  = data.get("attachments") or []
 
         # ── Load existing record ──
-        c.execute("SELECT email_sent, raw_messages, id_image_urls FROM reservations WHERE reservation_id = ?",
+        c.execute("SELECT email_sent, raw_messages, id_image_urls, id_image_data FROM reservations WHERE reservation_id = ?",
                   (reservation_id,))
         row = c.fetchone()
         if row and row[0]:  # email already sent
             conn.close()
             return jsonify({"status": "already sent"}), 200
 
-        existing_messages  = json.loads(row[1]) if row and row[1] else []
+        existing_messages   = json.loads(row[1]) if row and row[1] else []
         existing_image_urls = json.loads(row[2]) if row and row[2] else []
+        try:
+            existing_image_data = json.loads(row[3]) if row and row[3] else []
+        except Exception:
+            existing_image_data = []
 
         # Add this message
         existing_messages.append({
@@ -377,7 +420,7 @@ def handle_webhook():
             "timestamp":   datetime.now().isoformat(),
         })
 
-        # Collect image URLs across all messages
+        # Collect new image URLs and download bytes immediately (Airbnb URLs expire in ~1 hour)
         for att in attachments:
             url       = att.get("url", att.get("download_url", ""))
             mime_type = att.get("type", att.get("mime_type", att.get("content_type", "")))
@@ -387,6 +430,22 @@ def handle_webhook():
                 )
                 if is_image:
                     existing_image_urls.append(url)
+                    # Download immediately before the signed URL expires
+                    try:
+                        img_resp = requests.get(url, timeout=30)
+                        if img_resp.status_code == 200:
+                            ct  = img_resp.headers.get("Content-Type", "")
+                            ext = "pdf" if "pdf" in ct else "heic" if "heic" in ct else "jpg"
+                            idx = len(existing_image_data) + 1
+                            existing_image_data.append({
+                                "filename": f"guest_id_{idx}.{ext}",
+                                "data":     base64.b64encode(img_resp.content).decode(),
+                            })
+                            print(f"[📎] Downloaded ID image {idx} for {reservation_id}")
+                        else:
+                            print(f"[WARN] ID image returned HTTP {img_resp.status_code}: {url}")
+                    except Exception as e:
+                        print(f"[WARN] Could not download ID image: {e}")
 
         # ── Extract info with AI ──
         all_text = "\n\n---\n\n".join(
@@ -437,16 +496,35 @@ def handle_webhook():
         has_email  = bool(extracted.get("contact_email"))
         has_dates  = bool(extracted.get("checkin_date") and extracted.get("checkout_date"))
         has_unit   = bool(extracted.get("unit_number"))
-        has_ids    = len(existing_image_urls) > 0
 
-        all_complete = has_names and has_phone and has_email and has_dates and has_unit and has_ids
+        # ID logic: wait until we have one ID per guest name, OR it's the day before check-in
+        guest_names_list  = extracted.get("guest_names") or []
+        expected_id_count = len(guest_names_list)
+        actual_id_count   = len(existing_image_data)  # use downloaded count, not URL count
+        has_some_ids      = actual_id_count > 0
+        has_all_ids       = expected_id_count > 0 and actual_id_count >= expected_id_count
+
+        # Check whether today is the day before (or the day of) check-in
+        is_day_before_checkin = False
+        checkin_str = extracted.get("checkin_date", "")
+        if checkin_str:
+            try:
+                checkin_dt = date.fromisoformat(checkin_str)
+                days_until_checkin = (checkin_dt - date.today()).days
+                is_day_before_checkin = days_until_checkin <= 1
+            except Exception:
+                pass
+
+        # Send when: all non-ID fields complete AND (all IDs received OR day-before deadline)
+        id_ready   = has_all_ids or (has_some_ids and is_day_before_checkin)
+        all_complete = has_names and has_phone and has_email and has_dates and has_unit and id_ready
 
         # ── Save / update DB ──
         c.execute("""
             INSERT OR REPLACE INTO reservations
             (reservation_id, guest_names, contact_number, contact_email,
-             checkin_date, checkout_date, unit_number, id_image_urls, email_sent, raw_messages, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+             checkin_date, checkout_date, unit_number, id_image_urls, id_image_data, email_sent, raw_messages, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
         """, (
             reservation_id,
             json.dumps(extracted.get("guest_names", [])),
@@ -456,26 +534,22 @@ def handle_webhook():
             extracted.get("checkout_date", ""),
             extracted.get("unit_number", ""),
             json.dumps(existing_image_urls),
+            json.dumps(existing_image_data),
             json.dumps(existing_messages),
             datetime.now().isoformat(),
         ))
         conn.commit()
 
-        # ── If complete, download IDs and send email ──
+        # ── If complete, send email using pre-downloaded image bytes ──
         if all_complete:
-            id_attachments = []
-            for i, url in enumerate(existing_image_urls):
-                try:
-                    resp = requests.get(url, timeout=30)
-                    if resp.status_code == 200:
-                        ct  = resp.headers.get("Content-Type", "")
-                        ext = "pdf" if "pdf" in ct else "heic" if "heic" in ct else "jpg"
-                        id_attachments.append((f"guest_id_{i + 1}.{ext}", resp.content))
-                except Exception as e:
-                    print(f"[WARN] Could not download ID image {url}: {e}")
+            id_attachments = [
+                (img["filename"], base64.b64decode(img["data"]))
+                for img in existing_image_data
+                if img.get("data")
+            ]
 
             try:
-                send_building_email(extracted, id_attachments)
+                send_building_email(extracted, id_attachments, to_email=building_email_to)
                 c.execute("UPDATE reservations SET email_sent = 1 WHERE reservation_id = ?", (reservation_id,))
                 conn.commit()
             except Exception as e:
@@ -485,11 +559,13 @@ def handle_webhook():
                 return jsonify({"error": f"Email failed: {e}"}), 500
         else:
             missing = []
-            if not has_names:  missing.append("guest names")
-            if not has_phone:  missing.append("contact number")
-            if not has_email:  missing.append("contact email")
-            if not has_dates:  missing.append("check-in/out dates")
-            if not has_ids:    missing.append("ID photo(s)")
+            if not has_names:    missing.append("guest names")
+            if not has_phone:    missing.append("contact number")
+            if not has_email:    missing.append("contact email")
+            if not has_dates:    missing.append("check-in/out dates")
+            if not has_some_ids: missing.append("ID photo(s)")
+            elif not has_all_ids:
+                missing.append(f"IDs ({actual_id_count}/{expected_id_count} received — will send day before check-in if still incomplete)")
             print(f"[⏳] Reservation {reservation_id}: still waiting for {', '.join(missing)}")
 
         conn.close()
@@ -666,7 +742,7 @@ def debug_trigger_send(reservation_id):
     c = conn.cursor()
     c.execute("""
         SELECT guest_names, contact_number, contact_email,
-               checkin_date, checkout_date, unit_number, id_image_urls, email_sent
+               checkin_date, checkout_date, unit_number, id_image_urls, id_image_data, email_sent
         FROM reservations WHERE reservation_id = ?
     """, (reservation_id,))
     row = c.fetchone()
@@ -674,7 +750,7 @@ def debug_trigger_send(reservation_id):
         conn.close()
         return jsonify({"error": "No reservation found with that ID"}), 404
 
-    guest_names, contact_number, contact_email, checkin_date, checkout_date, unit_number, id_image_urls_raw, email_sent = row
+    guest_names, contact_number, contact_email, checkin_date, checkout_date, unit_number, id_image_urls_raw, id_image_data_raw, email_sent = row
 
     if email_sent:
         conn.close()
@@ -686,9 +762,9 @@ def debug_trigger_send(reservation_id):
         guest_names_list = []
 
     try:
-        image_urls = json.loads(id_image_urls_raw) if id_image_urls_raw else []
+        image_data = json.loads(id_image_data_raw) if id_image_data_raw else []
     except Exception:
-        image_urls = []
+        image_data = []
 
     missing = []
     if not guest_names_list: missing.append("guest names")
@@ -696,7 +772,7 @@ def debug_trigger_send(reservation_id):
     if not contact_email:    missing.append("contact email")
     if not checkin_date or not checkout_date: missing.append("dates")
     if not unit_number:      missing.append("unit number")
-    if not image_urls:       missing.append("ID photo(s)")
+    if not image_data:       missing.append("ID photo(s)")
 
     if missing:
         conn.close()
@@ -711,19 +787,11 @@ def debug_trigger_send(reservation_id):
         "unit_number":    unit_number,
     }
 
-    # Download ID images
-    id_attachments = []
-    for i, url in enumerate(image_urls):
-        try:
-            resp = requests.get(url, timeout=30)
-            if resp.status_code == 200:
-                ct  = resp.headers.get("Content-Type", "")
-                ext = "pdf" if "pdf" in ct else "heic" if "heic" in ct else "jpg"
-                id_attachments.append((f"guest_id_{i + 1}.{ext}", resp.content))
-            else:
-                print(f"[WARN] ID image {url} returned HTTP {resp.status_code}")
-        except Exception as e:
-            print(f"[WARN] Could not download ID image {url}: {e}")
+    # Use pre-downloaded image bytes (URLs expire after ~1 hour)
+    id_attachments = [
+        (img["filename"], base64.b64decode(img["data"]))
+        for img in image_data if img.get("data")
+    ]
 
     try:
         send_building_email(extracted, id_attachments)
@@ -743,6 +811,93 @@ def debug_trigger_send(reservation_id):
         LAST_ERROR = traceback.format_exc()
         conn.close()
         return jsonify({"error": str(e), "detail": "see /debug/last-error"}), 500
+
+
+@app.route("/check-pending", methods=["GET", "POST"])
+def check_pending():
+    """
+    Scan all reservations with email_sent=0 and send the registration email for any
+    where check-in is tomorrow (or today) and we have names/phone/email/unit + at least one ID.
+    Called daily by Railway Cron Job — also callable manually via browser.
+    """
+    global LAST_ERROR
+    today = date.today()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT reservation_id, guest_names, contact_number, contact_email,
+               checkin_date, checkout_date, unit_number, id_image_data
+        FROM reservations
+        WHERE email_sent = 0
+    """)
+    rows = c.fetchall()
+
+    sent = []
+    skipped = []
+
+    for row in rows:
+        res_id, guest_names_raw, phone, email_addr, checkin_str, checkout_str, unit, image_data_raw = row
+
+        # Parse fields
+        try:
+            guest_names = json.loads(guest_names_raw) if guest_names_raw and guest_names_raw not in ("null", "[]", "") else []
+        except Exception:
+            guest_names = []
+        try:
+            image_data = json.loads(image_data_raw) if image_data_raw else []
+        except Exception:
+            image_data = []
+
+        # Skip if missing required non-ID fields
+        if not (guest_names and phone and email_addr and checkin_str and checkout_str and unit):
+            skipped.append({"reservation_id": res_id, "reason": "missing required fields"})
+            continue
+
+        # Skip if no IDs at all
+        if not image_data:
+            skipped.append({"reservation_id": res_id, "reason": "no ID photos yet"})
+            continue
+
+        # Only send if check-in is tomorrow or today
+        try:
+            checkin_dt = date.fromisoformat(checkin_str)
+            days_until = (checkin_dt - today).days
+        except Exception:
+            skipped.append({"reservation_id": res_id, "reason": "invalid checkin date"})
+            continue
+
+        if days_until > 1:
+            skipped.append({"reservation_id": res_id, "reason": f"check-in in {days_until} days — not yet"})
+            continue
+
+        # Use pre-downloaded image bytes
+        extracted = {
+            "guest_names":    guest_names,
+            "contact_number": phone,
+            "contact_email":  email_addr,
+            "checkin_date":   checkin_str,
+            "checkout_date":  checkout_str,
+            "unit_number":    unit,
+        }
+        id_attachments = [
+            (img["filename"], base64.b64decode(img["data"]))
+            for img in image_data if img.get("data")
+        ]
+
+        building_email_to = resolve_building_email(unit)
+
+        try:
+            send_building_email(extracted, id_attachments, to_email=building_email_to)
+            c.execute("UPDATE reservations SET email_sent = 1 WHERE reservation_id = ?", (res_id,))
+            conn.commit()
+            sent.append({"reservation_id": res_id, "unit": unit, "sent_to": building_email_to})
+            print(f"[✅] check-pending: sent email for {res_id} ({unit})")
+        except Exception as e:
+            LAST_ERROR = traceback.format_exc()
+            skipped.append({"reservation_id": res_id, "reason": f"email failed: {e}"})
+
+    conn.close()
+    return jsonify({"sent": sent, "skipped": skipped, "checked_at": today.isoformat()}), 200
 
 
 # ─────────────────────────────────────────────
