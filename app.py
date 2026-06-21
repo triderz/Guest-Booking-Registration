@@ -248,8 +248,16 @@ def send_building_email(info, id_attachments, to_email=None):
     """
     recipient = to_email or BUILDING_EMAIL
     guest_names = info.get("guest_names") or []
-    checkin     = info.get("checkin_date", "TBD")
-    checkout    = info.get("checkout_date", "TBD")
+
+    def fmt_date(d):
+        """Convert YYYY-MM-DD to MM/DD/YYYY for the email."""
+        try:
+            return date.fromisoformat(d).strftime("%m/%d/%Y")
+        except Exception:
+            return d or "TBD"
+
+    checkin  = fmt_date(info.get("checkin_date", ""))
+    checkout = fmt_date(info.get("checkout_date", ""))
     unit        = info.get("unit_number") or "N/A"
     phone       = info.get("contact_number", "Not provided")
     email_addr  = info.get("contact_email", "Not provided")
