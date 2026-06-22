@@ -146,7 +146,16 @@ def get_reservation_details(reservation_id):
         if checkout and "T" in checkout:
             checkout = checkout.split("T")[0]
 
-        return {"guest_name": guest_name, "checkin": checkin, "checkout": checkout}
+        # Try common field names Hospitable uses for total guest count
+        guests_count = int(
+            res.get("guests_count") or
+            res.get("number_of_guests") or
+            res.get("num_guests") or
+            res.get("party_size") or
+            (res.get("guests") or {}).get("count") or
+            0
+        )
+        return {"guest_name": guest_name, "checkin": checkin, "checkout": checkout, "guests_count": guests_count}
     except Exception as e:
         print(f"[WARN] Could not fetch reservation details for {reservation_id}: {e}")
         return {}
@@ -441,10 +450,11 @@ def handle_webhook():
         res_details = get_reservation_details(reservation_id)
 
         context = {
-            "guest_name": res_details.get("guest_name", ""),
-            "checkin":    res_details.get("checkin", ""),
-            "checkout":   res_details.get("checkout", ""),
-            "unit":       extract_unit_label(unit_from_booking) or unit_from_booking,
+            "guest_name":   res_details.get("guest_name", ""),
+            "checkin":      res_details.get("checkin", ""),
+            "checkout":     res_details.get("checkout", ""),
+            "unit":         extract_unit_label(unit_from_booking) or unit_from_booking,
+            "guests_count": res_details.get("guests_count", 0),  # total guests from booking
         }
 
         # Message content + attachments
@@ -478,9 +488,12 @@ def handle_webhook():
             url       = att.get("url", att.get("download_url", ""))
             mime_type = att.get("type", att.get("mime_type", att.get("content_type", "")))
             if url and url not in existing_image_urls:
-                is_image = "image" in mime_type.lower() if mime_type else (
-                    any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".pdf", ".heic"))
-                )
+                # Strip query params before checking extension (Airbnb S3 URLs have ?aki_policy=... etc.)
+                url_path_lower = url.lower().split("?")[0]
+                if mime_type:
+                    is_image = "image" in mime_type.lower() or "pdf" in mime_type.lower()
+                else:
+                    is_image = any(url_path_lower.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".pdf", ".heic"))
                 if is_image:
                     existing_image_urls.append(url)
                     # Download immediately before the signed URL expires
@@ -552,10 +565,14 @@ def handle_webhook():
 
         # ID logic: wait until we have one ID per guest name, OR it's the day before check-in
         guest_names_list  = extracted.get("guest_names") or []
-        expected_id_count = len(guest_names_list)
+        # Use the larger of: names Claude extracted OR total guests from Hospitable booking API.
+        # This prevents sending too early when only 1 name is known but the booking has 2+ guests.
+        api_guests_count  = context.get("guests_count", 0)
+        expected_id_count = max(len(guest_names_list), api_guests_count) if api_guests_count > 0 else max(len(guest_names_list), 1)
         actual_id_count   = len(existing_image_data)  # use downloaded count, not URL count
         has_some_ids      = actual_id_count > 0
-        has_all_ids       = expected_id_count > 0 and actual_id_count >= expected_id_count
+        has_all_ids       = actual_id_count >= expected_id_count
+        print(f"[🆔] {reservation_id}: {actual_id_count}/{expected_id_count} IDs (names: {len(guest_names_list)}, api_guests: {api_guests_count})")
 
         # Check whether today is the day before (or the day of) check-in
         is_day_before_checkin = False
@@ -692,14 +709,32 @@ def debug_reservations():
     c = conn.cursor()
     c.execute("""
         SELECT reservation_id, guest_names, contact_number, contact_email,
-               checkin_date, checkout_date, unit_number, id_image_urls, email_sent, updated_at
+               checkin_date, checkout_date, unit_number, id_image_urls, id_image_data, email_sent, updated_at
         FROM reservations ORDER BY updated_at DESC
     """)
     rows = c.fetchall()
     conn.close()
-    keys = ["reservation_id", "guest_names", "contact_number", "contact_email",
-            "checkin_date", "checkout_date", "unit_number", "id_image_urls", "email_sent", "updated_at"]
-    return jsonify([dict(zip(keys, r)) for r in rows]), 200
+    result = []
+    for r in rows:
+        res_id, guest_names_raw, phone, email_addr, checkin, checkout, unit, urls_raw, data_raw, sent, updated = r
+        try:
+            id_data = json.loads(data_raw) if data_raw else []
+        except Exception:
+            id_data = []
+        result.append({
+            "reservation_id":   res_id,
+            "guest_names":      guest_names_raw,
+            "contact_number":   phone,
+            "contact_email":    email_addr,
+            "checkin_date":     checkin,
+            "checkout_date":    checkout,
+            "unit_number":      unit,
+            "id_images_stored": len(id_data),      # how many ID photos are saved
+            "id_filenames":     [i.get("filename") for i in id_data],
+            "email_sent":       sent,
+            "updated_at":       updated,
+        })
+    return jsonify(result), 200
 
 
 @app.route("/debug/test-reservation/<reservation_id>", methods=["GET"])
